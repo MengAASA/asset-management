@@ -3,6 +3,8 @@ import { verifyToken } from "@/lib/jwt";
 
 const PUBLIC_PATHS = ["/login", "/register", "/forgot-password", "/reset-password"];
 const PUBLIC_API_PREFIX = "/api/auth/";
+// The on-prem AD sync agent has no login cookie; these routes check X-Agent-Key themselves.
+const AGENT_API_PREFIX = "/api/ad/agent/";
 const BASE_PATH = "/phniams";
 
 // Next.js reads the nonce from the Content-Security-Policy request header and
@@ -35,6 +37,10 @@ export async function proxy(req: NextRequest) {
   // Allow public auth pages and auth API routes
   if (PUBLIC_PATHS.includes(logicalPath) || logicalPath.startsWith(PUBLIC_API_PREFIX)) {
     return NextResponse.next({ request: { headers: withNonce(req) } });
+  }
+
+  if (logicalPath.startsWith(AGENT_API_PREFIX)) {
+    return NextResponse.next();
   }
 
   const token = req.cookies.get("token")?.value;

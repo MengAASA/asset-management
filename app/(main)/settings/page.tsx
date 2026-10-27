@@ -1,6 +1,6 @@
 "use client";
 
-import { Building2, Tag, X, Trash2, Edit2, Plus, Upload, FileSpreadsheet, AlertCircle, Loader, Server, CheckCircle, XCircle } from "lucide-react";
+import { Building2, Tag, X, Trash2, Edit2, Plus, Upload, FileSpreadsheet, AlertCircle, Loader, Server, CheckCircle, XCircle, KeyRound, Copy, Check, RefreshCw } from "lucide-react";
 import { useEffect, useState, useRef } from "react";
 import { BASE_PATH } from "@/lib/utils";
 import ConfirmModal from "@/components/ConfirmModal";
@@ -8,15 +8,15 @@ import * as XLSX from "xlsx";
 
 interface Department { id: string; name: string; code: string; }
 interface Category { id: string; name: string; type: string; }
-interface ADConfig {
-  host: string; port: number; baseDN: string; bindDN: string;
-  bindPassword: string; userSearchBase: string; userFilter: string; useTLS: boolean;
-}
+interface AgentStatus { configured: boolean; keyCreatedAt: string | null; lastSeen: string | null; }
 
-const DEFAULT_AD: ADConfig = {
-  host: "", port: 389, baseDN: "", bindDN: "",
-  bindPassword: "", userSearchBase: "", userFilter: "", useTLS: false,
-};
+// The agent long-polls continuously while its scheduled task runs, so a check-in
+// older than this means the task has stopped.
+const AGENT_ONLINE_WINDOW_MS = 90_000;
+
+function isAgentOnline(lastSeen: string | null): boolean {
+  return !!lastSeen && Date.now() - new Date(lastSeen).getTime() < AGENT_ONLINE_WINDOW_MS;
+}
 
 type Tab = "ad" | "departments" | "categories";
 
@@ -44,25 +44,25 @@ export default function SettingsPage() {
   const [catError, setCatError] = useState("");
   const [catSaving, setCatSaving] = useState(false);
 
-  // AD Config
-  const [adConfig, setAdConfig] = useState<ADConfig>(DEFAULT_AD);
-  const [adSaving, setAdSaving] = useState(false);
-  const [adSaved, setAdSaved] = useState(false);
-  const [adTesting, setAdTesting] = useState(false);
-  const [adTestResult, setAdTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  // AD Sync Agent
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
+  const [newAgentKey, setNewAgentKey] = useState<string | null>(null);
+  const [generatingKey, setGeneratingKey] = useState(false);
+  const [confirmRegenerate, setConfirmRegenerate] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
 
   useEffect(() => {
     Promise.all([
       fetch(`${BASE_PATH}/api/auth/me`),
       fetch(`${BASE_PATH}/api/departments`),
       fetch(`${BASE_PATH}/api/categories`),
-      fetch(`${BASE_PATH}/api/config`),
-    ]).then(async ([meRes, dRes, cRes, adRes]) => {
+      fetch(`${BASE_PATH}/api/config/agent-key`),
+    ]).then(async ([meRes, dRes, cRes, agentRes]) => {
       if (meRes.ok) { const me = await meRes.json(); setIsAdmin(me?.role === "admin"); }
       else setIsAdmin(false);
       if (dRes.ok) setDepartments(await dRes.json());
       if (cRes.ok) setCategories(await cRes.json());
-      if (adRes.ok) { const d = await adRes.json(); if (d) setAdConfig({ ...DEFAULT_AD, ...d }); }
+      if (agentRes.ok) setAgentStatus(await agentRes.json());
     });
   }, []);
 
@@ -76,28 +76,25 @@ export default function SettingsPage() {
     if (res.ok) setCategories(await res.json());
   }
 
-  // --- AD ---
-  async function saveADConfig() {
-    setAdSaving(true); setAdSaved(false);
-    const res = await fetch(`${BASE_PATH}/api/config`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(adConfig),
-    });
-    setAdSaving(false);
-    if (res.ok) { setAdSaved(true); setTimeout(() => setAdSaved(false), 3000); }
+  // --- AD Sync Agent ---
+  async function fetchAgentStatus() {
+    const res = await fetch(`${BASE_PATH}/api/config/agent-key`);
+    if (res.ok) setAgentStatus(await res.json());
   }
 
-  async function testADConnection() {
-    setAdTesting(true); setAdTestResult(null);
-    const res = await fetch(`${BASE_PATH}/api/ad/test`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(adConfig),
-    });
-    const data = await res.json();
-    setAdTestResult(res.ok ? data : { ok: false, message: data.message ?? data.error });
-    setAdTesting(false);
+  async function generateAgentKey() {
+    setConfirmRegenerate(false);
+    setGeneratingKey(true); setKeyCopied(false);
+    const res = await fetch(`${BASE_PATH}/api/config/agent-key`, { method: "POST" });
+    setGeneratingKey(false);
+    if (res.ok) { const d = await res.json(); setNewAgentKey(d.key); fetchAgentStatus(); }
+    else alert("Failed to generate agent key.");
+  }
+
+  async function copyAgentKey() {
+    if (!newAgentKey) return;
+    await navigator.clipboard.writeText(newAgentKey);
+    setKeyCopied(true); setTimeout(() => setKeyCopied(false), 2000);
   }
 
   // --- Categories ---
@@ -205,7 +202,7 @@ export default function SettingsPage() {
   }
 
   const tabs: { key: Tab; label: string; icon: React.ReactNode }[] = [
-    { key: "ad", label: "AD Configuration", icon: <Server size={15} /> },
+    { key: "ad", label: "AD Sync Agent", icon: <Server size={15} /> },
     { key: "departments", label: "Departments", icon: <Building2 size={15} /> },
     { key: "categories", label: "Asset Categories", icon: <Tag size={15} /> },
   ];
@@ -239,79 +236,75 @@ export default function SettingsPage() {
         ))}
       </div>
 
-      {/* AD Configuration tab */}
+      {/* AD Sync Agent tab */}
       {activeTab === "ad" && (
         <div className="card">
           <h3 className="font-semibold text-sm text-slate-700 mb-1 flex items-center gap-2">
-            <Server size={16} color="#6366f1" /> Active Directory Configuration
+            <Server size={16} color="#6366f1" /> AD Sync Agent
           </h3>
           <p className="text-xs text-slate-400 mb-5">
-            Configure your on-premise AD to sync the employee directory.
+            A scheduled PowerShell script on an internal domain-joined server waits for &quot;Sync from AD&quot; requests,
+            reads users from Active Directory and sends them to this app over HTTPS. No inbound connection to your network is needed.
           </p>
 
-          <div className="form-grid mb-4">
-            <div>
-              <label className="form-label">Server Host *</label>
-              <input className="form-input" placeholder="192.168.0.10 or dc.phn.local"
-                value={adConfig.host} onChange={(e) => setAdConfig((c) => ({ ...c, host: e.target.value }))} />
-            </div>
-            <div>
-              <label className="form-label">Port</label>
-              <input type="number" className="form-input" value={adConfig.port}
-                onChange={(e) => setAdConfig((c) => ({ ...c, port: Number(e.target.value) }))} />
-            </div>
-            <div className="form-grid-full">
-              <label className="form-label">Base DN *</label>
-              <input className="form-input" placeholder="DC=phn,DC=local"
-                value={adConfig.baseDN} onChange={(e) => setAdConfig((c) => ({ ...c, baseDN: e.target.value }))} />
-            </div>
-            <div className="form-grid-full">
-              <label className="form-label">Bind DN (Service Account) *</label>
-              <input className="form-input" placeholder="CN=svc-assets,OU=Service Accounts,DC=phn,DC=local"
-                value={adConfig.bindDN} onChange={(e) => setAdConfig((c) => ({ ...c, bindDN: e.target.value }))} />
-            </div>
-            <div>
-              <label className="form-label">Bind Password *</label>
-              <input type="password" className="form-input" placeholder="Service account password"
-                value={adConfig.bindPassword} onChange={(e) => setAdConfig((c) => ({ ...c, bindPassword: e.target.value }))} />
-            </div>
-            <div>
-              <label className="form-label">User Search Base <span className="text-slate-400">(optional)</span></label>
-              <input className="form-input" placeholder="OU=Staff,DC=phn,DC=local"
-                value={adConfig.userSearchBase} onChange={(e) => setAdConfig((c) => ({ ...c, userSearchBase: e.target.value }))} />
-            </div>
-            <div className="form-grid-full">
-              <label className="form-label">User Filter <span className="text-slate-400">(optional — leave blank for default)</span></label>
-              <input className="form-input" placeholder="(&(objectClass=user)(department=IT))"
-                value={adConfig.userFilter} onChange={(e) => setAdConfig((c) => ({ ...c, userFilter: e.target.value }))} />
-            </div>
-            <div className="form-grid-full">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={adConfig.useTLS}
-                  onChange={(e) => setAdConfig((c) => ({ ...c, useTLS: e.target.checked, port: e.target.checked ? 636 : 389 }))} />
-                <span className="text-sm text-slate-600">Use LDAPS (TLS) — port 636</span>
-              </label>
-            </div>
-          </div>
+          {/* Status */}
+          {agentStatus && (() => {
+            const online = isAgentOnline(agentStatus.lastSeen);
+            return (
+              <div
+                className={`flex items-center justify-between gap-3 p-3 rounded-lg mb-4 text-sm ${online ? "bg-green-50 text-green-700" : "bg-amber-50 text-amber-800"}`}
+                style={{ border: `1px solid ${online ? "#bbf7d0" : "#fde68a"}` }}
+              >
+                <div className="flex items-center gap-2">
+                  {online ? <CheckCircle size={16} /> : <XCircle size={16} />}
+                  {!agentStatus.configured
+                    ? "No agent key generated yet."
+                    : online
+                      ? "Agent is online."
+                      : agentStatus.lastSeen
+                        ? `Agent offline — last seen ${new Date(agentStatus.lastSeen).toLocaleString()}.`
+                        : "Agent has never connected."}
+                </div>
+                <button className="p-1 rounded hover:bg-white/60" title="Refresh status" onClick={fetchAgentStatus}>
+                  <RefreshCw size={14} />
+                </button>
+              </div>
+            );
+          })()}
 
-          {adTestResult && (
-            <div
-              className={`flex items-center gap-2 p-3 rounded-lg mb-4 text-sm ${adTestResult.ok ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"}`}
-              style={{ border: `1px solid ${adTestResult.ok ? "#bbf7d0" : "#fecaca"}` }}
-            >
-              {adTestResult.ok ? <CheckCircle size={16} /> : <XCircle size={16} />}
-              {adTestResult.message}
+          {/* Newly generated key — shown once */}
+          {newAgentKey && (
+            <div className="p-3 rounded-lg mb-4 bg-blue-50 text-sm" style={{ border: "1px solid #bfdbfe" }}>
+              <div className="font-medium text-blue-800 mb-1">New agent key</div>
+              <div className="text-xs text-blue-700 mb-2">
+                Copy it now — it won&apos;t be shown again. Paste it into <code className="bg-white px-1 rounded">$ApiKey</code> in ad-sync-agent.ps1.
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 bg-white px-2 py-1.5 rounded font-mono text-xs break-all" style={{ border: "1px solid #bfdbfe" }}>
+                  {newAgentKey}
+                </code>
+                <button className="btn btn-secondary" style={{ padding: "4px 10px", fontSize: 12 }} onClick={copyAgentKey}>
+                  {keyCopied ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy</>}
+                </button>
+              </div>
             </div>
           )}
 
-          <div className="flex items-center gap-3">
-            <button className="btn btn-secondary" onClick={testADConnection} disabled={adTesting}>
-              {adTesting ? <Loader size={14} className="animate-spin" /> : <Server size={14} />}
-              {adTesting ? "Testing..." : "Test Connection"}
+          <div className="flex items-center gap-3 mb-5">
+            <button className="btn btn-primary" disabled={generatingKey}
+              onClick={() => agentStatus?.configured ? setConfirmRegenerate(true) : generateAgentKey()}>
+              {generatingKey ? <Loader size={14} className="animate-spin" /> : <KeyRound size={14} />}
+              {agentStatus?.configured ? "Regenerate Agent Key" : "Generate Agent Key"}
             </button>
-            <button className="btn btn-primary" onClick={saveADConfig} disabled={adSaving}>
-              {adSaving ? "Saving..." : adSaved ? "Saved ✓" : "Save Configuration"}
-            </button>
+          </div>
+
+          {/* Setup steps */}
+          <div className="text-xs text-slate-500 space-y-1.5">
+            <div className="font-medium text-slate-600 text-sm mb-1">Setup</div>
+            <div>1. Copy <code className="bg-slate-100 px-1 rounded">scripts/ad-sync-agent.ps1</code> to a domain-joined server, e.g. <code className="bg-slate-100 px-1 rounded">C:\PHNIAMS\ad-sync-agent.ps1</code>.</div>
+            <div>2. Edit the settings at the top: <code className="bg-slate-100 px-1 rounded">$ServerUrl</code>, <code className="bg-slate-100 px-1 rounded">$ApiKey</code> and optionally the search base / filter.</div>
+            <div>3. Run the script once with <code className="bg-slate-100 px-1 rounded">-Install</code> from an elevated PowerShell to register the scheduled task.</div>
+            <div>4. Refresh this page — the status above should show &quot;Agent is online&quot;.</div>
           </div>
         </div>
       )}
@@ -429,6 +422,12 @@ export default function SettingsPage() {
           message="Are you sure you want to delete this department? This will fail if employees or assets are still assigned to it."
           confirmLabel="Delete" variant="danger"
           onConfirm={deleteDepartment} onCancel={() => setDeleteDeptId(null)} />
+      )}
+      {confirmRegenerate && (
+        <ConfirmModal title="Regenerate Agent Key"
+          message="The current key will stop working immediately. You will need to update $ApiKey in the agent script on the internal server."
+          confirmLabel="Regenerate" variant="danger"
+          onConfirm={generateAgentKey} onCancel={() => setConfirmRegenerate(false)} />
       )}
       {deleteCatId && (
         <ConfirmModal title="Delete Category"

@@ -118,6 +118,22 @@ model SystemConfig {
   @@map("systemconfig")
 }
 
+// On-demand AD sync: the app creates a request, the on-prem agent claims it,
+// queries AD and pushes the users back as JSON.
+model AdSyncRequest {
+  id          String    @id @default(cuid())
+  status      String    @default("pending") // pending | processing | completed | failed
+  requestedBy String?
+  payload     String?   @db.LongText
+  error       String?   @db.Text
+  createdAt   DateTime  @default(now())
+  claimedAt   DateTime?
+  completedAt DateTime?
+
+  @@index([status, createdAt])
+  @@map("adsyncrequest")
+}
+
 model User {
   id        String   @id @default(cuid())
   name      String

@@ -158,30 +158,56 @@ interface ADSyncModalProps {
 }
 
 const PAGE_SIZE = 50;
+const SYNC_POLL_INTERVAL_MS = 1500;
+// Safety net only — the server fails the request itself if the agent doesn't respond.
+const SYNC_CLIENT_TIMEOUT_MS = 180_000;
 
 function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
   const [adUsers, setAdUsers] = useState<ADUser[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncStage, setSyncStage] = useState<"pending" | "processing">("pending");
+  const [syncedAt, setSyncedAt] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ imported: number; updated: number; skipped: number } | null>(null);
   const [page, setPage] = useState(1);
 
+  // Ask the on-prem agent for fresh AD data, then poll until it has pushed the users back
   useEffect(() => {
-    fetch(`${BASE_PATH}/api/ad/users`)
-      .then(async (res) => {
-        if (!res.ok) {
-          const d = await res.json();
-          setError(d.error ?? "Failed to fetch AD users.");
-        } else {
-          const data: ADUser[] = await res.json();
-          console.log("ad user: ", data);
-          setAdUsers(data);
+    let cancelled = false;
+
+    async function runSync() {
+      try {
+        const res = await fetch(`${BASE_PATH}/api/ad/sync-request`, { method: "POST" });
+        const d = await res.json();
+        if (!res.ok) { setError(d.error ?? "Failed to start AD sync."); return; }
+
+        const started = Date.now();
+        while (!cancelled) {
+          await new Promise((r) => setTimeout(r, SYNC_POLL_INTERVAL_MS));
+          if (cancelled) return;
+
+          const sRes = await fetch(`${BASE_PATH}/api/ad/sync-request/${d.id}`);
+          const s = await sRes.json();
+          if (!sRes.ok || s.status === "failed") { setError(s.error ?? "AD sync failed."); return; }
+          if (s.status === "completed") {
+            setAdUsers(s.users);
+            setSyncedAt(s.completedAt);
+            return;
+          }
+          setSyncStage(s.status);
+          if (Date.now() - started > SYNC_CLIENT_TIMEOUT_MS) { setError("Timed out waiting for the AD server."); return; }
         }
-      })
-      .catch(() => setError("Network error."))
-      .finally(() => setLoading(false));
+      } catch {
+        if (!cancelled) setError("Network error.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    runSync();
+    return () => { cancelled = true; };
   }, []);
 
   const totalPages = Math.max(1, Math.ceil(adUsers.length / PAGE_SIZE));
@@ -307,7 +333,8 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
         <div className="flex flex-col" style={{ flex: 1, minHeight: 0, padding: "1.25rem 1.5rem", overflow: "hidden" }}>
         {loading && (
           <div className="flex items-center justify-center gap-3 py-12 text-slate-500">
-            <Loader size={20} className="animate-spin" /> Connecting to Active Directory...
+            <Loader size={20} className="animate-spin" />
+            {syncStage === "pending" ? "Waiting for the AD server..." : "Reading users from Active Directory..."}
           </div>
         )}
 
@@ -315,11 +342,11 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
           <div className="flex items-start gap-3 p-4 rounded-lg bg-amber-50 text-amber-800 text-sm" style={{ border: "1px solid #fde68a" }}>
             <AlertTriangle size={18} className="shrink-0 mt-0.5" />
             <div>
-              <div className="font-medium mb-1">Unable to connect</div>
+              <div className="font-medium mb-1">Unable to sync</div>
               <div>{error}</div>
-              {error.includes("configured") && (
-                <a href="/settings" className="text-blue-600 underline mt-1 block">
-                  Go to Settings → Active Directory Configuration
+              {error.includes("agent") && (
+                <a href={`${BASE_PATH}/settings`} className="text-blue-600 underline mt-1 block">
+                  Go to Settings → AD Sync Agent
                 </a>
               )}
             </div>
@@ -342,6 +369,9 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
             <div className="flex items-center justify-between mb-3 px-1 flex-wrap gap-2">
               <div className="text-sm text-slate-500">
                 {adUsers.length} users · {adUsers.filter((u) => !u.alreadyImported).length} new · {adUsers.filter((u) => u.alreadyImported && u.hasChanges).length} changed · {selected.size} selected
+                {syncedAt && (
+                  <span className="text-xs text-slate-400"> · fetched {new Date(syncedAt).toLocaleTimeString()}</span>
+                )}
               </div>
               <div className="flex items-center gap-4 text-sm text-slate-600">
                 <label className="flex items-center gap-1.5 cursor-pointer">
