@@ -31,13 +31,13 @@ param(
 # ============================== Settings ==============================
 
 # App URL including the /phniams base path, no trailing slash
-$ServerUrl  = "http://localhost:3001/phniams"
-# $ServerUrl  = "https://forma.phn.com.my/phniams" live
+# $ServerUrl  = "http://localhost:3001/phniams" dev
+$ServerUrl  = "https://forma.phn.com.my/phniams"
 
 # Generated in the app under Settings -> AD Sync Agent
 # $ApiKey     = "PASTE-AGENT-KEY-HERE"
-# $ApiKey     = "Uf0CKmxDea4Z1XMuXydiwTgR1al-nxdYdnRU1lU3vQk" live
-$ApiKey     = "wVBSuj26-hLICCNwM4o0__4FHW51wAZwzPRn-tQIasw"
+$ApiKey     = "Uf0CKmxDea4Z1XMuXydiwTgR1al-nxdYdnRU1lU3vQk" 
+# $ApiKey     = "wVBSuj26-hLICCNwM4o0__4FHW51wAZwzPRn-tQIasw" dev
 
 # Where to search for users. Blank = the whole domain. e.g. "OU=Staff,DC=phn,DC=local"
 $SearchBase = ""
