@@ -1,14 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getActingUser, logAudit } from "@/lib/audit";
+import { employeeConflictMessage } from "@/lib/api-errors";
 
 export async function PUT(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  // Kept outside the try so the catch can explain unique-field clashes
+  let submitted: { email?: string; staffId?: string | null } = {};
   try {
     const { id } = await params;
     const body = await req.json();
+    submitted = body;
     const before = await prisma.employee.findUnique({ where: { id } });
     const employee = await prisma.employee.update({
       where: { id },
@@ -36,6 +40,8 @@ export async function PUT(
 
     return NextResponse.json(employee);
   } catch (error) {
+    const conflict = await employeeConflictMessage(error, submitted);
+    if (conflict) return NextResponse.json({ error: conflict }, { status: 409 });
     console.error(error);
     return NextResponse.json({ error: "Failed to update employee" }, { status: 500 });
   }

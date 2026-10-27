@@ -170,7 +170,10 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
-  const [importResult, setImportResult] = useState<{ imported: number; updated: number; skipped: number } | null>(null);
+  const [importResult, setImportResult] = useState<{
+    imported: number; updated: number; skipped: number;
+    skippedUsers: { name: string; email: string; reason: string }[];
+  } | null>(null);
   const [page, setPage] = useState(1);
 
   // Ask the on-prem agent for fresh AD data, then poll until it has pushed the users back
@@ -242,12 +245,25 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
   const pageImportable = pageUsers.filter((u) => !u.alreadyImported || u.hasChanges);
   const allPageSelected = pageImportable.length > 0 && pageImportable.every((u) => selected.has(u.email));
 
-  function generateDeptCode(name: string): string {
+  // Initials of each word, keeping numbers / roman numerals whole so "PM I" and "PM II" differ.
+  // A number suffix is added when the code is already taken ("QD" -> "QD2").
+  function generateDeptCode(name: string, takenCodes: Set<string>): string {
     const words = name.trim().split(/\s+/);
-    const code = words.length === 1
-      ? name.substring(0, 5).toUpperCase()
-      : words.map((w) => w[0]).join("").toUpperCase();
-    return code.substring(0, 20);
+    const base = (words.length === 1
+      ? name.trim().substring(0, 5)
+      : words.map((w) => (/^([IVX]+|\d+)$/i.test(w) ? w : w[0])).join("")
+    ).toUpperCase().substring(0, 20);
+
+    let code = base;
+    for (let n = 2; takenCodes.has(code); n++) {
+      code = base.substring(0, 20 - String(n).length) + n;
+    }
+    return code;
+  }
+
+  async function errorMessage(res: Response, fallback: string): Promise<string> {
+    const d = await res.json().catch(() => null);
+    return d?.error ?? `${fallback} (HTTP ${res.status})`;
   }
 
   async function handleImport() {
@@ -255,30 +271,47 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
     const toImport = adUsers.filter((u) => selected.has(u.email));
     let imported = 0;
     let updated = 0;
-    let skipped = 0;
+    const skippedUsers: { name: string; email: string; reason: string }[] = [];
+    const skip = (u: ADUser, reason: string) => skippedUsers.push({ name: u.displayName, email: u.email, reason });
 
     // Build dept map from existing departments (case-insensitive)
     const deptMap = new Map(departments.map((d) => [d.name.toLowerCase(), d.id]));
+    const takenCodes = new Set(departments.map((d) => d.code.toUpperCase()));
+    const deptErrors = new Map<string, string>();
 
     // Auto-create any AD departments not yet in the system
     const uniqueADDepts = [...new Set(toImport.map((u) => u.department).filter(Boolean))];
     for (const deptName of uniqueADDepts) {
-      if (!deptMap.has(deptName.toLowerCase())) {
+      if (deptMap.has(deptName.toLowerCase())) continue;
+
+      // Retry with the next suffix if the code turns out to be taken (e.g. department list is stale)
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const code = generateDeptCode(deptName, takenCodes);
+        takenCodes.add(code);
         const res = await fetch(`${BASE_PATH}/api/departments`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: deptName, code: generateDeptCode(deptName) }),
+          body: JSON.stringify({ name: deptName, code }),
         });
         if (res.ok) {
           const created = await res.json();
           deptMap.set(deptName.toLowerCase(), created.id);
+          break;
+        }
+        if (res.status !== 409) {
+          deptErrors.set(deptName.toLowerCase(), await errorMessage(res, "Failed to create department"));
+          break;
         }
       }
     }
 
     for (const u of toImport) {
       const deptId = deptMap.get(u.department.toLowerCase());
-      if (!deptId) { skipped++; continue; }
+      if (!deptId) {
+        const why = deptErrors.get(u.department.toLowerCase()) ?? "no unique department code available";
+        skip(u, `Department "${u.department}" could not be created: ${why}`);
+        continue;
+      }
 
       const payload = {
         name: u.displayName,
@@ -292,42 +325,46 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
       if (u.alreadyImported) {
         // Update existing employee — look up by email first
         const empRes = await fetch(`${BASE_PATH}/api/employees?search=${encodeURIComponent(u.email)}`);
-        if (!empRes.ok) { skipped++; continue; }
+        if (!empRes.ok) { skip(u, await errorMessage(empRes, "Could not look up the existing employee")); continue; }
         const empList = await empRes.json();
         const existing = empList.find((e: { email: string }) => e.email.toLowerCase() === u.email.toLowerCase());
-        if (!existing) { skipped++; continue; }
+        if (!existing) { skip(u, "Existing employee record not found by email."); continue; }
         const putRes = await fetch(`${BASE_PATH}/api/employees/${existing.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        putRes.ok ? updated++ : skipped++;
+        if (putRes.ok) updated++;
+        else skip(u, await errorMessage(putRes, "Failed to update employee"));
       } else {
         const res = await fetch(`${BASE_PATH}/api/employees`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        res.ok ? imported++ : skipped++;
+        if (res.ok) imported++;
+        else skip(u, await errorMessage(res, "Failed to create employee"));
       }
     }
 
     setImporting(false);
-    setImportResult({ imported, updated, skipped });
-    setTimeout(() => onImported(), 1500);
+    setImportResult({ imported, updated, skipped: skippedUsers.length, skippedUsers });
+    // Keep the modal open when something was skipped so the reasons can be read
+    if (skippedUsers.length === 0) setTimeout(() => onImported(), 1500);
   }
 
 
   const showResults = !loading && !error && !importResult && adUsers.length > 0;
 
   return (
-    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && (importResult ? onImported() : onClose())}>
       <div className="modal modal-shell" style={{ maxWidth: 700, maxHeight: "80vh" }}>
         <div className="modal-pinned-header">
           <h2 className="modal-title flex items-center gap-2">
             <Users size={18} /> Sync from Active Directory
           </h2>
-          <button className="p-1 rounded hover:bg-slate-100" onClick={onClose}><X size={18} /></button>
+          {/* After an import, closing also refreshes the employee list */}
+          <button className="p-1 rounded hover:bg-slate-100" onClick={importResult ? onImported : onClose}><X size={18} /></button>
         </div>
 
         <div className="flex flex-col" style={{ flex: 1, minHeight: 0, padding: "1.25rem 1.5rem", overflow: "hidden" }}>
@@ -361,6 +398,38 @@ function ADSyncModal({ departments, onClose, onImported }: ADSyncModalProps) {
             {importResult.updated > 0 && <span>{importResult.updated} updated</span>}
             {importResult.skipped > 0 && <span> · {importResult.skipped} skipped</span>}
           </div>
+        )}
+
+        {importResult && importResult.skippedUsers.length > 0 && (
+          <>
+            <div className="flex items-center gap-2 mt-4 mb-2 text-sm font-medium text-amber-800">
+              <AlertTriangle size={15} /> {importResult.skippedUsers.length} user{importResult.skippedUsers.length !== 1 ? "s" : ""} skipped
+            </div>
+            <div className="overflow-auto flex-1 rounded-lg scroll-light" style={{ border: "1px solid #e2e8f0" }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {importResult.skippedUsers.map((s) => (
+                    <tr key={s.email}>
+                      <td className="text-sm">
+                        <div className="font-medium">{s.name}</div>
+                        <div className="text-xs text-slate-400">{s.email}</div>
+                      </td>
+                      <td className="text-sm text-amber-700">{s.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex justify-end mt-4">
+              <button className="btn btn-primary" onClick={onImported}>Done</button>
+            </div>
+          </>
         )}
 
         {showResults && (
